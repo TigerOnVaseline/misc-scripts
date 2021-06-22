@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+
+# check_ceph_latency
+# Test Ceph write latency with rados (8)
+
+# Copyright (C) J. M. Reilly 2018. All rights reserved.
+
+# This code is licensed under MIT license:
+# http://opensource.org/licenses/MIT
+
+# Revision 0.9
+
+# Requires
+# bash-4.0 or higher
+
+# POSIX conventions and the Shell Style Guide have been adhered to where viable
+# https://google.github.io/styleguide/shell.xml
+
+# Linted with shellcheck: https://github.com/koalaman/shellcheck
+
+# References:
+# https://assets.nagios.com/downloads/nagioscore/docs/nagioscore/3/en/perfdata.html
+# https://nagios-plugins.org/doc/guidelines.html#AEN200
+
+
+# DISCLAIMER
+# Whilst care has been taken to thoroughly test this script using a variety of
+# cases, as with all Linux/UNIX-like affairs, it may still fail in mysterious
+# circumstances.
+
+# Read arguments and count into arrays to prevent them getting mangled
+readonly SCRIPT_NAME=${0##*/}
+readonly -a ARGV=("$@")
+readonly ARGC=("$#")
+readonly MIN_BASH_VERSION=4
+readonly REQUIRED_COMMANDS="awk rados timeout"
+readonly BENCH_SECONDS=10 # Number of seconds to RADOS benchmark
+readonly BENCH_THREADS=1
+readonly BENCH_OBJECTSIZE=65536 #64KiB
+# Exit codes to pass to Icinga
+readonly STATE_OK=0
+readonly STATE_WARNING=1
+readonly STATE_CRITICAL=2
+readonly STATE_UNKNOWN=3
+
+show_usage() {
+    cat <<- _EOF_ >&2
+
+Usage:  ${SCRIPT_NAME} -p POOL [-C OPTION]|[-W OPTION] 
+
+This script checks Ceph latency and optionally verifies if the latency is above the maximum latency threshhold
+
+OPTIONS
+    -p   pool name
+    -C   critical max
+    -W   warning max
+
+EXAMPLES
+    ${SCRIPT_NAME} -C 750 -W 350 -p benchtest-data
+
+_EOF_
+}
+
+benchmark_rados_latency(){
+    local bench_pool="$1"
+    timeout 30s rados bench --pool="${bench_pool}" "${BENCH_SECONDS}" write \
+    -t "${BENCH_THREADS}" -b "${BENCH_OBJECTSIZE}" 2>/dev/null | \
+    # Extract all lines containing a latency figure, convert seconds to ms and
+    # convert to the nearest integer by padding to three chars and rounding up
+    awk 'tolower($2) == "latency(s):" {printf "%3.0f\n", ($3 * 1000)}'
+}
+
+main() {
+    local required_command
+    local option
+    local max_warning
+    local max_critical
+    local test_pool
+    local bench_latency
+    local average_latency
+    local stddev_latency
+    local max_latency
+    local min_latency
+    local service_status
+    local status_message
+
+
+    if [[ "${BASH_VERSINFO[0]}" -lt "${MIN_BASH_VERSION}" ]]; then
+        echo >&2 "Error: This script requires bash-4.0 or higher"
+        exit "${STATE_UNKNOWN}"
+    fi
+
+    if [[ "${EUID}" -ne  "0" ]]; then
+        echo >&2 "Error: This script must be run as root or with sudo (8)"
+        exit "${STATE_UNKNOWN}"
+    fi
+
+    # POSIX-compliant method for checking a command is available
+    for required_command in ${REQUIRED_COMMANDS}
+    do
+        if ! type "${required_command}" >/dev/null 2>&1; then
+            echo >&2 "Error: This script requires ${required_command}"
+            exit "${STATE_UNKNOWN}"
+        fi
+    done
+
+    while getopts "W:C:p:" option
+    do
+         case $option in
+        W)
+            max_warning="${OPTARG}"
+            ;;
+        C)
+            max_critical="${OPTARG}"
+            ;;
+        p)
+            test_pool="${OPTARG}"
+            ;;
+        *)
+            show_usage
+            exit "${STATE_UNKNOWN}"
+            ;;
+         esac
+    done
+
+    if [[ -z "${test_pool}" ]]; then
+        echo >&2 "Error: please specify a pool with -p"
+        exit "${STATE_UNKNOWN}"
+    fi
+
+    # Get benchmark latency figures into an array
+    bench_latency=($(benchmark_rados_latency "${test_pool}"))
+
+    average_latency=${bench_latency[0]}
+    stddev_latency=${bench_latency[1]}
+    max_latency=${bench_latency[2]}
+    min_latency=${bench_latency[3]}
+
+    if [[ -z ${max_latency} ]]; then
+        service_status=${STATE_CRITICAL}
+        status_message="CRITICAL - unable to parse result"
+        echo "${status_message}"
+        exit ${STATE_CRITICAL}
+    elif [[ -n ${max_critical} && ${max_latency} -gt ${max_critical} ]]; then
+        service_status=${STATE_CRITICAL}
+        status_message="CRITICAL"
+    elif [[ -n ${max_warning} && ${max_latency} -gt ${max_warning} ]]; then
+        service_status=${STATE_WARNING}
+        status_message="WARNING"
+    else
+        service_status=${STATE_OK}
+        status_message="OK"
+    fi
+
+    # Print status and performance data
+    cat << _EOF_
+${status_message} - \
+Average latency: ${average_latency}ms; \
+Minimum latency: ${min_latency}ms; \
+Standard deviation latency: ${stddev_latency}ms; \
+Maximum latency: ${max_latency}ms\
+|'average_latency'=${average_latency}ms \
+'stddev_latency'=${stddev_latency}ms \
+'max_latency'=${max_latency}ms \
+'min_latency'=${min_latency}ms
+_EOF_
+
+    exit ${service_status}
+}
+
+main "${ARGV[@]}"
